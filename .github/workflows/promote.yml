@@ -1,0 +1,109 @@
+name: Promote
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the artifact
+        run: |
+          mkdir -p out
+          cat > out/release.txt <<EOF
+          commit:   ${{ github.sha }}
+          run:      ${{ github.run_id }}
+          built at: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+          cat out/release.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: out/release.txt
+
+  deploy-dev:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+
+      - name: Show the claim
+        run: |
+          TOKEN=$(curl -sS \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" \
+            | jq -r .value)
+          python3 -c "
+          import base64, json, sys
+          p = sys.argv[1].split('.')[1]
+          c = json.loads(base64.urlsafe_b64decode(p + '=' * (-len(p) % 4)))
+          print(c['sub'])
+          " "$TOKEN"
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy
+        run: |
+          echo "--- deploying this artifact ---"
+          cat release.txt
+          az group show --name ${{ vars.AZURE_RESOURCE_GROUP }} --query name -o tsv
+          az tag update --resource-id /subscriptions/${{ vars.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ vars.AZURE_RESOURCE_GROUP }} \
+            --operation merge --tags deployedSha=${{ github.sha }}
+
+  deploy-uat:
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    environment: uat
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy
+        run: |
+          cat release.txt
+          az tag update --resource-id /subscriptions/${{ vars.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ vars.AZURE_RESOURCE_GROUP }} \
+            --operation merge --tags deployedSha=${{ github.sha }}
+
+  deploy-prod:
+    needs: deploy-uat
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy
+        run: |
+          cat release.txt
+          az tag update --resource-id /subscriptions/${{ vars.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ vars.AZURE_RESOURCE_GROUP }} \
+            --operation merge --tags deployedSha=${{ github.sha }}
